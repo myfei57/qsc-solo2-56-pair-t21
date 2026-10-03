@@ -59,6 +59,7 @@ class DoorSection:
     open_hold_s: float = 30.0
     close_confirm_s: float = 6.0
     lockout_release_s: float = 12.0
+    command_ttl_s: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,8 @@ class PlatformConfig:
             raise ConfigError("停站时长上限必须为正", component="config")
         if self.door.batch_limit <= 0:
             raise ConfigError("批量开门上限必须为正", component="config")
+        if self.door.command_ttl_s <= 0:
+            raise ConfigError("门控指令时效必须为正", component="config")
         if self.gap.min_clearance_mm < 0:
             raise ConfigError("最小间隙不能为负", component="config")
         if self.signal.stale_after_s <= 0:

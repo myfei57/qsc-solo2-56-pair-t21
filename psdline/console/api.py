@@ -68,6 +68,8 @@ class Api:
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
+        add("GET", "/api/commands/{trainID}", self._commands)
+        add("GET", "/api/dispositions", self._dispositions)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
@@ -79,6 +81,8 @@ class Api:
         add("POST", "/api/gap", self._gap)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
+        add("POST", "/api/execute-next", self._execute_next)
+        add("POST", "/api/void-expired", self._void_expired)
         add("POST", "/api/renumber", self._renumber)
         add("POST", "/api/batch-open", self._batch_open)
         add("POST", "/api/fault", self._fault)
@@ -201,15 +205,31 @@ class Api:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
 
     def _enqueue(self, params: dict, body: dict) -> dict:
+        ttl = body.get("ttl_s")
         return self._platform.enqueue(
             _require(body, "train_id"),
             _require(body, "id"),
             str(body.get("kind", "open")),
             str(body.get("station_id", "")),
+            priority=str(body.get("priority", "normal")),
+            ttl_s=None if ttl is None else _as_float(body, "ttl_s", 0.0),
         )
 
     def _process(self, params: dict, body: dict) -> dict:
         return self._platform.process_queue(_require(body, "train_id"))
+
+    def _execute_next(self, params: dict, body: dict) -> dict:
+        return self._platform.execute_next(_require(body, "train_id"))
+
+    def _void_expired(self, params: dict, body: dict) -> dict:
+        train_id = str(body.get("train_id", ""))
+        return self._platform.void_expired(train_id or None)
+
+    def _commands(self, params: dict, body: dict) -> dict:
+        return self._platform.command_queue(str(params.get("trainID", "")))
+
+    def _dispositions(self, params: dict, body: dict) -> dict:
+        return self._platform.command_dispositions(str(params.get("train_id", "")))
 
     def _renumber(self, params: dict, body: dict) -> dict:
         groups = body.get("groups")

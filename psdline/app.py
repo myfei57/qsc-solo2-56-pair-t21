@@ -18,16 +18,22 @@ from .door import (
     active_group,
     batch_open,
     close_and_audit,
+    command_state,
     depart,
     depart_policy,
+    dispositions,
     door_report,
     door_state,
     enqueue,
+    execute_next,
     open_pressure,
     open_doors,
     open_group,
     process_queue,
     queued_total,
+    recover_commands,
+    void_expired,
+    void_expired_all,
 )
 from .errors import RailError
 from .eventbus import Event, EventBus
@@ -136,6 +142,7 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._command_recovery: dict = {}
         self._event_counts: dict[str, int] = {}
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
@@ -213,13 +220,16 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与指令队列现场。"""
 
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self._command_recovery = recover_commands(self.doors, self.audit, self.clock.now())
+        for train_id in self._command_recovery.get("trains", []):
+            self._publish_command_hazard(train_id, command_state(self.doors, train_id))
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -548,18 +558,120 @@ class Platform:
             "violations": [],
         }
 
-    def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
-        """把一条门控指令排进队列。"""
+    def enqueue(
+        self,
+        train_id: str,
+        command_id: str,
+        kind: str,
+        station_id: str = "",
+        priority: str = "normal",
+        ttl_s: float | None = None,
+    ) -> dict:
+        """把一条门控指令排进队列；紧急指令插到待执行区队首。
 
-        command = enqueue(self.doors, train_id, command_id, kind, station_id)
-        self.audit.record(
-            "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
+        ``ttl_s`` 缺省时取配置 ``door.command_ttl_s``；传 0 表示不过期。同一
+        标识的指令仍在队列时按幂等处理：返回原指令且不重复写审计。
+        """
+
+        ttl = self.config.door.command_ttl_s if ttl_s is None else float(ttl_s)
+        command, inserted = enqueue(
+            self.doors,
+            train_id,
+            command_id,
+            kind,
+            station_id,
+            priority=priority,
+            ttl_s=ttl,
+            at=self.clock.now(),
         )
-        return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
+        if not inserted:
+            return {
+                "ok": True,
+                "train_id": train_id,
+                "command": command.as_dict(),
+                "deduplicated": True,
+                "violations": [],
+            }
+        self.audit.record(
+            "door_enqueue",
+            train_id,
+            station_id,
+            command_id=command.id,
+            command_kind=kind,
+            priority=command.priority,
+            ttl_s=command.ttl_s,
+            expires_at=command.expires_at,
+        )
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "command": command.as_dict(),
+            "deduplicated": False,
+            "violations": [],
+        }
+
+    def execute_next(self, train_id: str) -> dict:
+        """执行列车队首指令：先作废超时指令，再执行队首并落处置结果。"""
+
+        report = execute_next(self.doors, self.audit, train_id, self.clock.now())
+        self._publish_command_hazard(train_id, report.get("state", {}))
+        return report
+
+    def void_expired(self, train_id: str | None = None) -> dict:
+        """作废超时未执行的指令；不传列车时扫描全部有队列的列车。"""
+
+        now = self.clock.now()
+        if train_id:
+            found = void_expired(self.doors, self.audit, train_id, now)
+            self._publish_command_hazard(train_id, command_state(self.doors, train_id))
+            return {
+                "ok": True,
+                "voided": {train_id: found} if found else {},
+                "violations": [],
+            }
+        found_all = void_expired_all(self.doors, self.audit, now)
+        for tid in found_all:
+            self._publish_command_hazard(tid, command_state(self.doors, tid))
+        return {"ok": True, "voided": found_all, "violations": []}
+
+    def command_queue(self, train_id: str) -> dict:
+        """返回列车指令队列、门控指令状态与处置结果。"""
+
+        executing = self.commands.executing(train_id)
+        return {
+            "train_id": train_id,
+            "pending": [command.as_dict() for command in self.commands.pending(train_id)],
+            "executing": executing.as_dict() if executing else None,
+            "state": command_state(self.doors, train_id),
+            "dispositions": dispositions(self.audit, train_id),
+        }
+
+    def command_dispositions(self, train_id: str = "") -> dict:
+        """查询门控指令的处置结果（完成 / 作废），来自只追加的审计流水。"""
+
+        return {"ok": True, "dispositions": dispositions(self.audit, train_id), "violations": []}
+
+    def _publish_command_hazard(self, train_id: str, state: dict) -> None:
+        """门开着而队列里没有任何关门意图时发告警事件。"""
+
+        hazard = str(state.get("hazard", ""))
+        if not hazard:
+            return
+        self.bus.publish(
+            Event.of(
+                "audit",
+                "door",
+                hazard,
+                train_id=train_id,
+                severity="alarm",
+                message=f"门开着但队列里已没有任何关门意图: {train_id}",
+            )
+        )
 
     def process_queue(self, train_id: str) -> dict:
-        """返回列车队列里待执行的门控指令，并带上发车自检结果。"""
+        """返回列车队列里待执行的门控指令（先作废已超时指令），并带上发车自检结果。"""
 
+        void_expired(self.doors, self.audit, train_id, self.clock.now())
         policy = depart_policy(self.doors, train_id)
         ids = process_queue(self.doors, train_id)
         self.audit.record("door_process", train_id, "", queued=len(ids))
@@ -679,6 +791,9 @@ class Platform:
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
         interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
+        voided = void_expired_all(self.doors, self.audit, moment)
+        for train_id in voided:
+            self._publish_command_hazard(train_id, command_state(self.doors, train_id))
         holding = [
             train.id
             for train in self.trains.list()
@@ -696,6 +811,7 @@ class Platform:
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
+            "voided_commands": {train_id: len(items) for train_id, items in voided.items()},
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
             "violations": [],
         }
@@ -737,6 +853,7 @@ class Platform:
                 for gate in self.gates.list()
             ],
             "door_report": door_report(self.doors, self.namespace.station_ids()),
+            "command_recovery": self._command_recovery,
             "signals": signal_summary(self.signals, ids),
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio

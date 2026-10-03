@@ -74,7 +74,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
     queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
+    urgent = platform.enqueue(args.train, "cmd-urgent-close", "close", args.station, priority="urgent")
     processed = platform.process_queue(args.train)
+    executed = platform.execute_next(args.train)
     swept = platform.sweep(args.station)
     fault = platform.set_fault(_first_gate(platform, args.station))
     cleared = platform.clear_fault(_first_gate(platform, args.station))
@@ -100,7 +102,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "position": position,
         "gap": gap,
         "queued": {key: queued[key] for key in ("ok", "train_id")},
+        "urgent": {key: urgent[key] for key in ("ok", "deduplicated")},
         "processed": processed,
+        "executed": {key: executed[key] for key in ("ok", "executed", "violations")},
         "swept": swept,
         "batch": {key: batched[key] for key in ("ok", "order", "opened", "nearest")},
         "renumber": {key: renumber[key] for key in ("ok", "revision", "active_group")},
@@ -122,6 +126,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     for name, operation in (
         ("arrival", arrival),
         ("processed", processed),
+        ("executed", executed),
         ("renumber", renumber),
         ("cleared", cleared),
         ("sequence", sequence),

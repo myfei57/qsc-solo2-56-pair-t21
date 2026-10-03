@@ -8,9 +8,22 @@
 
 from __future__ import annotations
 
-from .commands import CommandLog, DoorCommand
+from .commands import (
+    PRIORITY_NORMAL,
+    PRIORITY_URGENT,
+    CommandLog,
+    DoorCommand,
+)
 from .jsonfile import JsonStore
 from .journal import JsonlJournal
 from .metrics import StoreMetrics
 
-__all__ = ["CommandLog", "DoorCommand", "JsonStore", "JsonlJournal", "StoreMetrics"]
+__all__ = [
+    "PRIORITY_NORMAL",
+    "PRIORITY_URGENT",
+    "CommandLog",
+    "DoorCommand",
+    "JsonStore",
+    "JsonlJournal",
+    "StoreMetrics",
+]

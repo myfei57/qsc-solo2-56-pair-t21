@@ -18,7 +18,8 @@ def depart_policy(controller: DoorController, train_id: str) -> dict:
     checks = {
         "opened": opened(controller, train_id),
         "close_durable": close_durable(controller, train_id),
-        "queue_empty": not process_queue(controller, train_id),
+        "queue_empty": not process_queue(controller, train_id)
+        and controller.commands.executing(train_id) is None,
     }
     failures = [name for name, passed in checks.items() if not passed]
     return {"allowed": not failures, "checks": checks, "failures": failures}
