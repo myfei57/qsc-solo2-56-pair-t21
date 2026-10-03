@@ -182,6 +182,41 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pq(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    action = args.action
+    if action == "submit":
+        if not args.id:
+            print("submit 需要 --id", file=sys.stderr)
+            return 2
+        payload = platform.pq_submit(
+            args.train, args.id, args.kind, args.station,
+            ttl_s=args.ttl, use_default_ttl=not args.no_default_ttl,
+        )
+    elif action == "pump":
+        payload = platform.pq_pump(args.train)
+    elif action == "drain":
+        payload = platform.pq_drain(args.train)
+    elif action == "retry-failsafe":
+        payload = platform.pq_retry_failsafe(args.train)
+    elif action == "safe":
+        payload = platform.pq_is_safe(args.train)
+    elif action == "worker-start":
+        payload = platform.pq_worker_start()
+    elif action == "worker-stop":
+        payload = platform.pq_worker_stop()
+    elif action == "view":
+        payload = platform.pq_view(args.train)
+    elif action == "dispositions":
+        payload = platform.pq_dispositions(args.train)
+    elif action == "history":
+        payload = platform.pq_history(args.train)
+    elif action == "verify":
+        payload = {"chains": platform.pq_verify(None)}
+    _dump(payload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +251,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    pq = sub.add_parser("pq", help="优先级门控队列：提交/泵送/查询", parents=[common])
+    pq.add_argument("action", choices=("submit", "pump", "drain", "retry-failsafe", "safe",
+                                       "view", "dispositions", "history", "verify",
+                                       "worker-start", "worker-stop"))
+    pq.add_argument("--train", default="T01", help="列车标识")
+    pq.add_argument("--id", default="", help="指令标识（submit 必填）")
+    pq.add_argument("--kind", default="open", help="指令类别")
+    pq.add_argument("--station", default="", help="站台标识")
+    pq.add_argument("--ttl", type=float, default=None, help="时效秒数（缺省用策略默认）")
+    pq.add_argument("--no-default-ttl", action="store_true", help="该指令永不过期")
+    pq.set_defaults(func=_cmd_pq)
     return parser
 
 

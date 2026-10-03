@@ -79,6 +79,17 @@ class Api:
         add("POST", "/api/gap", self._gap)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
+        add("POST", "/api/pq-submit", self._pq_submit)
+        add("POST", "/api/pq-pump", self._pq_pump)
+        add("POST", "/api/pq-drain", self._pq_drain)
+        add("POST", "/api/pq-retry-failsafe", self._pq_retry_failsafe)
+        add("GET", "/api/pq-safe/{trainID}", self._pq_safe)
+        add("POST", "/api/pq-worker/start", lambda p, b: self._platform.pq_worker_start())
+        add("POST", "/api/pq-worker/stop", lambda p, b: self._platform.pq_worker_stop())
+        add("GET", "/api/pq-view/{trainID}", self._pq_view)
+        add("GET", "/api/pq-dispositions/{trainID}", self._pq_dispositions)
+        add("GET", "/api/pq-history/{trainID}", self._pq_history)
+        add("POST", "/api/pq-verify", self._pq_verify)
         add("POST", "/api/renumber", self._renumber)
         add("POST", "/api/batch-open", self._batch_open)
         add("POST", "/api/fault", self._fault)
@@ -210,6 +221,50 @@ class Api:
 
     def _process(self, params: dict, body: dict) -> dict:
         return self._platform.process_queue(_require(body, "train_id"))
+
+    def _pq_submit(self, params: dict, body: dict) -> dict:
+        ttl_raw = body.get("ttl_s", "__default__")
+        ttl_s = None
+        use_default_ttl = True
+        if ttl_raw != "__default__":
+            use_default_ttl = False
+            if ttl_raw is not None:
+                ttl_s = _as_float(body, "ttl_s", 0.0)
+        stations = body.get("stations")
+        return self._platform.pq_submit(
+            _require(body, "train_id"),
+            _require(body, "id"),
+            str(body.get("kind", "open")),
+            str(body.get("station_id", "")),
+            ttl_s=ttl_s,
+            stations=tuple(str(s) for s in stations) if isinstance(stations, list) else (),
+            use_default_ttl=use_default_ttl,
+        )
+
+    def _pq_pump(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_pump(_require(body, "train_id"))
+
+    def _pq_drain(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_drain(_require(body, "train_id"))
+
+    def _pq_retry_failsafe(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_retry_failsafe(_require(body, "train_id"))
+
+    def _pq_safe(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_is_safe(str(params.get("trainID", "")))
+
+    def _pq_view(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_view(str(params.get("trainID", "")))
+
+    def _pq_dispositions(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_dispositions(str(params.get("trainID", "")))
+
+    def _pq_history(self, params: dict, body: dict) -> dict:
+        return self._platform.pq_history(str(params.get("trainID", "")))
+
+    def _pq_verify(self, params: dict, body: dict) -> dict:
+        train_id = str(body.get("train_id", "")) if isinstance(body, dict) else ""
+        return {"chains": self._platform.pq_verify(train_id or None)}
 
     def _renumber(self, params: dict, body: dict) -> dict:
         groups = body.get("groups")

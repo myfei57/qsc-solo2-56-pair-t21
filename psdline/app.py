@@ -29,6 +29,13 @@ from .door import (
     process_queue,
     queued_total,
 )
+from .door.pq import (
+    DoorActuator,
+    GateActuator,
+    PreemptPolicy,
+    PriorityQueueRunner,
+    PQWorker,
+)
 from .errors import RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
@@ -85,12 +92,14 @@ class Platform:
         config: PlatformConfig | None = None,
         clock: Clock | None = None,
         unit: str | None = None,
+        pq_actuator: DoorActuator | None = None,
     ) -> None:
         self.config = (config or default_config()).validate()
         self.clock = clock or SystemClock()
         self.bus = EventBus()
         self.unit = unit or self.config.platform.unit
         self.ids = IdFactory("op")
+        self._pq_actuator_override = pq_actuator
 
         store = JsonStore(self.config.storage_root)
         self.store = store
@@ -133,6 +142,10 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        # 优先级门控队列（惰性装配）：执行器直接驱动站台门登记表，审计复用平台审计。
+        self._pq: PriorityQueueRunner | None = None
+        self._pq_worker: PQWorker | None = None
 
         self._cycles = 0
         self._operations = 0
@@ -571,6 +584,141 @@ class Platform:
             "violations": list(policy["failures"]),
         }
 
+    # ---- 优先级门控队列 -----------------------------------------------
+
+    @property
+    def pq(self) -> PriorityQueueRunner:
+        """惰性装配优先级门控队列执行器。"""
+
+        if self._pq is None:
+            # 新进程启动后先恢复平台审计的幂等索引，保证哈希链镜像不重复。
+            self.audit.seed_idempotency()
+            actuator = self._pq_actuator_override or GateActuator(self.gates, self.lockouts)
+            self._pq = PriorityQueueRunner(
+                self.store,
+                self.clock,
+                actuator,
+                bus=self.bus,
+                audit=self.audit,
+                policy=PreemptPolicy(self.config.pq.policy),
+                default_ttl_s=self.config.pq.default_ttl_s,
+                emergency_ttl_s=self.config.pq.emergency_ttl_s,
+                max_attempts=self.config.pq.max_attempts,
+            )
+        return self._pq
+
+    def pq_submit(
+        self,
+        train_id: str,
+        command_id: str,
+        kind: str,
+        station_id: str = "",
+        *,
+        ttl_s: float | None = None,
+        stations: tuple[str, ...] = (),
+        use_default_ttl: bool = True,
+    ) -> dict:
+        """向优先级门控队列幂等提交一条指令（紧急关门插到队首）。
+
+        ``use_default_ttl=True`` 时使用策略默认时效；显式传 ``ttl_s`` 覆盖；
+        ``ttl_s=None`` 且 ``use_default_ttl=False`` 表示该指令永不过期。
+        """
+
+        from .door.pq import USE_DEFAULT_TTL
+
+        ttl = float(ttl_s) if ttl_s is not None else (USE_DEFAULT_TTL if use_default_ttl else None)
+        return self.pq.submit(
+            train_id, command_id, kind, station_id,
+            ttl_s=ttl, stations=tuple(stations),
+        )
+
+    def pq_pump(self, train_id: str) -> dict:
+        """推进一个可中断执行单元（紧急抢占、时效作废都在泵送时结算）。"""
+
+        return self.pq.pump(train_id)
+
+    def pq_drain(self, train_id: str) -> dict:
+        """把列车队列泵送回明确状态。"""
+
+        return self.pq.drain(train_id)
+
+    def pq_retry_failsafe(self, train_id: str) -> dict:
+        """现场修复后显式解除故障安全阻塞并重关门。"""
+
+        return self.pq.retry_failsafe(train_id)
+
+    def pq_is_safe(self, train_id: str) -> dict:
+        """门控是否已回到明确安全状态（CLOSED、无待收敛站台、队列空闲）。"""
+
+        return {
+            "train_id": train_id,
+            "safe": self.pq.is_safe(train_id),
+            "recovered": self.pq.is_recovered(train_id),
+        }
+
+    def pq_view(self, train_id: str) -> dict:
+        """返回列车优先级队列、门态与待收敛站台的一致性视图。"""
+
+        return self.pq.view(train_id)
+
+    def pq_dispositions(self, train_id: str) -> dict:
+        """返回该列车全部作废/失败/中止指令的可查处置结果。"""
+
+        return {"train_id": train_id, "dispositions": self.pq.dispositions(train_id)}
+
+    def pq_history(self, train_id: str) -> dict:
+        """返回该列车不可变的哈希链流水。"""
+
+        return {"train_id": train_id, "events": self.pq.history(train_id)}
+
+    def pq_verify(self, train_id: str | None = None) -> dict:
+        """校验哈希链完整性，返回每列车通过的事件条数。"""
+
+        return self.pq.verify_chain(train_id)
+
+    def pq_worker_start(self) -> dict:
+        """启动后台泵送线程（在线服务使用；仿真可直接调 pump）。"""
+
+        if self._pq_worker is None:
+            self._pq_worker = PQWorker(self.pq).start()
+        return {"ok": True, "running": self._pq_worker.running}
+
+    def pq_worker_stop(self) -> dict:
+        if self._pq_worker is not None:
+            self._pq_worker.stop()
+            self._pq_worker = None
+        return {"ok": True, "running": False}
+
+    def _pq_summary(self) -> dict:
+        """状态快照里的优先级队列摘要（未装配时只给策略，不触发装配）。"""
+
+        summary = {
+            "policy": self.config.pq.policy,
+            "default_ttl_s": self.config.pq.default_ttl_s,
+            "emergency_ttl_s": self.config.pq.emergency_ttl_s,
+            "trains": [],
+        }
+        if self._pq is None:
+            summary["active"] = False
+            return summary
+        summary["active"] = True
+        summary["owner_epoch"] = self._pq.owner_epoch
+        summary["worker_running"] = bool(self._pq_worker and self._pq_worker.running)
+        trains = []
+        for train_id in self._pq.known_trains():
+            view = self._pq.view(train_id)
+            trains.append(
+                {
+                    "train_id": train_id,
+                    "pending_total": view["pending_total"],
+                    "running": view["running"]["id"] if view["running"] else None,
+                    "door_state": view["door_state"],
+                    "unsafe_stations": view["unsafe_stations"],
+                }
+            )
+        summary["trains"] = trains
+        return summary
+
     def clear_fault(self, psd_id: str) -> dict:
         """清除门区故障并按条件解锁。"""
 
@@ -748,6 +896,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "priority_queue": self._pq_summary(),
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }
@@ -881,10 +1030,11 @@ def build_platform(
     clock: Clock | None = None,
     storage_root: str | None = None,
     unit: str | None = None,
+    pq_actuator: DoorActuator | None = None,
 ) -> Platform:
     """构造一个平台；``storage_root`` 可覆盖配置里的存储目录。"""
 
     base = config or default_config()
     if storage_root is not None:
         base = with_storage_root(base, storage_root)
-    return Platform(base, clock=clock, unit=unit)
+    return Platform(base, clock=clock, unit=unit, pq_actuator=pq_actuator)

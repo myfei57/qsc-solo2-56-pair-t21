@@ -103,6 +103,23 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class PriorityQueueSection:
+    """优先级门控队列策略。
+
+    ``policy``：``preempt_normal``（紧急关门可抢占正在执行的普通指令，默认）或
+    ``wait_running``（任何指令开始执行后都不打断）；
+    ``default_ttl_s``：普通指令默认时效（None 表示默认不过期）；
+    ``emergency_ttl_s``：紧急关门时效，默认 None——安全义务不被时效作废；
+    ``max_attempts``：瞬时故障重试次数，耗尽后作废并转故障安全关门。
+    """
+
+    policy: str = "preempt_normal"
+    default_ttl_s: float | None = 30.0
+    emergency_ttl_s: float | None = None
+    max_attempts: int = 3
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +141,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    pq: PriorityQueueSection = field(default_factory=PriorityQueueSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +187,16 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.pq.policy not in ("preempt_normal", "wait_running"):
+            raise ConfigError(
+                "门控插队策略只能是 preempt_normal 或 wait_running", component="config"
+            )
+        if self.pq.default_ttl_s is not None and self.pq.default_ttl_s <= 0:
+            raise ConfigError("普通门控指令默认时效必须为正或为 null", component="config")
+        if self.pq.emergency_ttl_s is not None and self.pq.emergency_ttl_s <= 0:
+            raise ConfigError("紧急门控指令时效必须为正或为 null", component="config")
+        if self.pq.max_attempts < 1:
+            raise ConfigError("门控重试次数必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +241,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "pq": dict(config.pq.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +262,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        pq=_section(PriorityQueueSection, payload.get("pq")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

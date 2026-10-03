@@ -21,6 +21,7 @@ packages = [
     "psdline.sig",
     "psdline.interlock",
     "psdline.door",
+    "psdline.door.pq",
     "psdline.platform",
     "psdline.gap",
     "psdline.quota",
